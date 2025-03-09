@@ -1,6 +1,6 @@
 # Web Scraping
 from browserforge.fingerprints import Screen
-import playwright
+import playwright.async_api
 import camoufox
 
 # Standard Library
@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import threading
 import argparse
+import asyncio
 import queue
 import time
 import os
@@ -20,6 +21,14 @@ from rich.logging import RichHandler
 from rich.theme import Theme
 import logging
 
+# Arguments
+Parser = argparse.ArgumentParser(description='Google Photos Downloader')
+Parser.add_argument('-d', '--debug', action='store_true', help='Enable Debug Mode')
+Parser.add_argument('-hl', '--headless', action='store_true', help='Enable Headless Mode')
+Parser.add_argument('-p', '--port', type=int, help='Server Port', default=8282)
+Parser.add_argument('-i', '--allow-images', action='store_true', help='Allow Image Loading')
+Args = Parser.parse_args()
+
 # Setup
 class Config:
 	BaseURL = 'https://photos.google.com/'
@@ -28,7 +37,7 @@ class Config:
 	GPhotoURLReal = 'https://photos.google.com/photo/'
 	Profile = Path(os.getcwd() + r'\profile')
 	DownloadDirectory = Path(os.getcwd() + r'\downloads')
-	ServerPort = 8282
+	ServerPort = Args.port
 	QueueMaxWait = 30
 
 os.makedirs(Config.Profile, exist_ok=True)
@@ -56,12 +65,6 @@ ThemeDict = {
 	'browser.warning': '#F5D7A3',
 	'browser.info': '#A0D6B4',
 }
-
-# Arguments
-Parser = argparse.ArgumentParser(description='Google Photos Downloader')
-Parser.add_argument('-d', '--debug', action='store_true', help='Enable Debug Mode')
-Parser.add_argument('-hl', '--headless', action='store_true', help='Enable Headless Mode')
-Args = Parser.parse_args()
 
 def InitLogging():
 	Console = RichConsole(theme=Theme(ThemeDict), force_terminal=True, log_path=False, 
@@ -94,7 +97,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 		elif self.path.startswith('/id/'):
 			PhotoID = self.path[4:]
 			try:
-				self.App.Receive(PhotoID)
+				asyncio.run_coroutine_threadsafe(self.App.Receive(PhotoID), self.App.EventLoop)
 				while self.App.GlobalQueue.empty():
 					time.sleep(0.1)
 				FilePath = self.App.GlobalQueue.get()
@@ -103,7 +106,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 					self.end_headers()
 					self.wfile.write(File.read())
 				os.remove(FilePath)
-				Log.info(f'Deleted File: {FilePath}')
+				Log.debug(f'Deleted File: {FilePath}')
 			except Exception as E:
 				Log.error(f'Download Failed: {E}')
 				self.send_response(500)
@@ -115,8 +118,26 @@ class RequestHandler(BaseHTTPRequestHandler):
 # Browser
 class Photos:
 	def __init__(self, Headless: bool = False):
-		self.PlaywrightInstance = playwright.sync_api.sync_playwright().start()
-		self.Instance = camoufox.NewBrowser(
+		self.EventLoop = asyncio.new_event_loop()
+		self.InitTask = self.EventLoop.create_task(self.Initialize(Headless))
+		self.ProcessorTask = None
+		self.Queue = asyncio.Queue(maxsize=1)
+		self.GlobalQueue = queue.Queue(maxsize=1)
+		
+		self.LoopThread = threading.Thread(target=self._RunEventLoop)
+		self.LoopThread.daemon = True
+		self.LoopThread.start()
+		
+		while not hasattr(self, 'IsInitialized') or not self.IsInitialized:
+			time.sleep(0.1)
+		
+	def _RunEventLoop(self):
+		asyncio.set_event_loop(self.EventLoop)
+		self.EventLoop.run_forever()
+	
+	async def Initialize(self, Headless: bool):
+		self.PlaywrightInstance = await playwright.async_api.async_playwright().start()
+		self.Instance = await camoufox.AsyncNewBrowser(
 			playwright=self.PlaywrightInstance,
 			from_options=camoufox.launch_options(
 				screen=Screen(
@@ -132,41 +153,63 @@ class Photos:
 				headless=Headless,
 				java_script_enabled=True,
 				i_know_what_im_doing=True,
-				block_images=True,
-				args=['--mute-audio', '--disable-audio-output']
+				block_images=not Args.allow_images,
+				args=[
+					'--mute-audio', 
+					'--disable-audio-output',
+					'--disable-extensions',
+					'--disable-component-extensions-with-background-pages',
+					'--disable-background-networking',
+					'--disable-background-timer-throttling',
+					'--disable-backgrounding-occluded-windows',
+					'--disable-breakpad',
+					'--disable-default-apps',
+					'--disable-dev-shm-usage',
+					'--disable-features=TranslateUI,BlinkGenPropertyTrees',
+					'--disable-ipc-flooding-protection',
+					'--disable-renderer-backgrounding',
+					'--enable-features=NetworkService,NetworkServiceInProcess',
+					'--force-color-profile=srgb',
+					'--hide-scrollbars',
+					'--metrics-recording-only',
+					'--no-first-run',
+					'--password-store=basic'
+				]
 			),
 			persistent_context=True
 		)
 		self.Page = self.Instance.pages[0]
-		self.Queue = queue.Queue(maxsize=1)
-		self.GlobalQueue = queue.Queue(maxsize=1)
-		self.Setup()
+		await self.Setup()
 		Log.info('Please Login To Google Photos')
-		self.Page.goto(Config.LoginURL)
+		await self.Page.goto(Config.LoginURL)
+
 		while not self.Page.url.startswith(Config.BaseURL):
 			Log.debug(f'Current URL: {self.Page.url}')
-			time.sleep(1)
+			await asyncio.sleep(1)
+		
 		Log.info('Logged In')
-		self.Page.goto('about:blank')
+		await self.Page.goto('about:blank')
 		self.StartServer()
+		self.ProcessorTask = self.EventLoop.create_task(self.ProcessQueue())
+		self.IsInitialized = True
 	
-	def Setup(self):
+	async def Setup(self):
 		Log.debug('Setting Up Browser Timeouts')
 		self.Page.context.set_default_timeout(0)
 		self.Page.context.set_default_navigation_timeout(0)
 	
-	def Download(self, PhotoID):
+	async def Download(self, PhotoID):
 		Log.debug(f'Downloading Photo ID: {PhotoID[:10]}...')
-		self.Page.goto(Config.GPhotoURL + PhotoID)
+		await self.Page.goto(Config.GPhotoURL + PhotoID)
 		
-		with self.Page.expect_download() as Info:
-			self.Page.keyboard.press('Shift+D')
+		async with self.Page.expect_download() as Info:
+			await self.Page.keyboard.press('Shift+D')
 		
-		Download = Info.value
+		Download = await Info.value
 		FilePath = str(Config.DownloadDirectory / Download.suggested_filename)
-		Download.save_as(FilePath)
+		await Download.save_as(FilePath)
 		Log.info(f'Downloaded Photo ID: {PhotoID[:10]}...')
-		self.Page.goto('about:blank')
+		await self.Page.goto('about:blank')
 		return FilePath
 	
 	def StartServer(self):
@@ -176,44 +219,59 @@ class Photos:
 		ServerThread.start()
 		Log.debug(f'Server Started On Port {Config.ServerPort}')
 	
-	def Receive(self, PhotoID):
+	async def Receive(self, PhotoID):
 		Log.debug(f'Received Photo ID: {PhotoID[:10]}')
-		self.Queue.put(PhotoID)
+		await self.Queue.put(PhotoID)
 
-	def Close(self):
+	async def ProcessQueue(self):
 		try:
-			if self.Instance:
-				self.Instance.close()
-			if self.PlaywrightInstance:
-				self.PlaywrightInstance.stop()
-		except playwright.sync_api.Error:
+			while True:
+				Log.debug(f'Queue Size: {self.Queue.qsize()}')
+				if not self.Queue.empty():
+					PhotoID = await self.Queue.get()
+					FilePath = await self.Download(PhotoID)
+					self.GlobalQueue.put(FilePath)
+					self.Queue.task_done()
+				await asyncio.sleep(0.1)
+		except Exception as E:
+			Log.error(f'Queue processor error: {E}')
+			
+	async def Close(self):
+		try:
+			if hasattr(self, 'Instance') and self.Instance:
+				await self.Instance.close()
+			if hasattr(self, 'PlaywrightInstance') and self.PlaywrightInstance:
+				await self.PlaywrightInstance.stop()
+		except playwright.async_api.Error:
 			Log.warning('Browser Has Been Closed')
+			
+	def Shutdown(self):
+		if self.EventLoop and self.EventLoop.is_running():
+			self.EventLoop.create_task(self.Close())
+			self.EventLoop.call_soon_threadsafe(self.EventLoop.stop)
+		self.LoopThread.join(timeout=5)
+		Log.warning('Exiting')
 
 if __name__ == '__main__':
-    try:
-        Log.info('Starting Browser')
-        Instance = Photos(Args.headless)
-        Log.info('Browser Started')
-        StopEvent = threading.Event()
-        try:
-            while not StopEvent.is_set():
-                Log.debug(f'Queue Size: {Instance.Queue.qsize()}')
-                if not Instance.Queue.empty():
-                    PhotoID = Instance.Queue.get()
-                    FilePath = Instance.Download(PhotoID)
-                    Instance.GlobalQueue.put(FilePath)
-                    Instance.Queue.task_done()
-                time.sleep(0.1)
-        except KeyboardInterrupt:
-            Log.warning('Keyboard Interrupt Detected - Force Exiting')
-            os._exit(0)
-    except Exception as E:
-        Log.error(f'[{E.__class__.__name__}] {E}')
-        os._exit(1)
-    finally:
-        if 'Instance' in locals():
-            try:
-                Instance.Close()
-            except Exception:
-                pass
-        Log.warning('Exiting')
+	Instance = None
+	try:
+		Log.info('Starting Browser')
+		Instance = Photos(Args.headless)
+		Log.info('Browser Started')
+		
+		try:
+			while True:
+				time.sleep(0.5)
+		except KeyboardInterrupt:
+			Log.warning('Keyboard Interrupt Detected - Force Exiting')
+			if Instance:
+				Instance.Shutdown()
+			os._exit(0)
+	except Exception as E:
+		Log.error(f'[{E.__class__.__name__}] {E}')
+		if Instance:
+			Instance.Shutdown()
+		os._exit(1)
+	finally:
+		for File in Config.DownloadDirectory.iterdir():
+			File.unlink()
