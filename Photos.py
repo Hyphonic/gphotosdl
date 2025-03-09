@@ -35,13 +35,10 @@ class Config:
 	LoginURL = 'https://photos.google.com/login'
 	GPhotoURL = 'https://photos.google.com/lr/photo/'
 	GPhotoURLReal = 'https://photos.google.com/photo/'
-	Profile = Path(os.getcwd() + r'\profile')
-	DownloadDirectory = Path(os.getcwd() + r'\downloads')
+	Profile = Path(os.path.join(os.getcwd(), 'profile'))
+	DownloadDirectory = Path(os.path.join(os.getcwd(), 'downloads'))
 	ServerPort = Args.port
 	QueueMaxWait = 30
-
-os.makedirs(Config.Profile, exist_ok=True)
-os.makedirs(Config.DownloadDirectory, exist_ok=True)
 
 # Logging Setup
 class DownloadHighlighter(RegexHighlighter):
@@ -52,6 +49,8 @@ class DownloadHighlighter(RegexHighlighter):
 		r'\[(?P<warning>warning|Warning)\]',
 		r'\[(?P<info>info|Info)\]',
 		r'\[(?P<debug>debug|Debug)\]',
+		r'(?P<size>\d+\.\d+ [KMGT]B)',
+		r'\.\.\.(?P<hash>[a-zA-Z0-9-_]{10})'
 	]
 
 ThemeDict = {
@@ -64,12 +63,15 @@ ThemeDict = {
 	'browser.error': '#F5A3A3',
 	'browser.warning': '#F5D7A3',
 	'browser.info': '#A0D6B4',
+	'browser.debug': '#B3D7EC',
+	'browser.size': '#A0D6B4',
+	'browser.hash': '#B3D7EC',
 }
 
 def InitLogging():
-	Console = RichConsole(theme=Theme(ThemeDict), force_terminal=True, log_path=False, 
+	Console = RichConsole(theme=Theme(ThemeDict), force_terminal=True, log_path=False,
 						 highlighter=DownloadHighlighter(), color_system='truecolor')
-	ConsoleHandler = RichHandler(markup=True, rich_tracebacks=True, show_time=True, 
+	ConsoleHandler = RichHandler(markup=True, rich_tracebacks=True, show_time=True,
 								console=Console, show_path=False, omit_repeated_times=True,
 								highlighter=DownloadHighlighter())
 	ConsoleHandler.setFormatter(logging.Formatter('%(message)s', datefmt='[%H:%M:%S]'))
@@ -81,6 +83,19 @@ def InitLogging():
 	Install(show_locals=True, console=Console, max_frames=1)
 	return Console, Log
 Console, Log = InitLogging()
+
+Log.debug('Setting Up Directories')
+Log.debug(f'Profile Directory: {Config.Profile}')
+os.makedirs(Config.Profile, exist_ok=True)
+Log.debug(f'Download Directory: {Config.DownloadDirectory}')
+os.makedirs(Config.DownloadDirectory, exist_ok=True)
+
+# Humanize Bytes
+def HumanizeBytes(Bytes):
+	for Unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+		if Bytes < 1024 or Unit == 'TB':
+			return f'{Bytes:.2f} {Unit}'
+		Bytes /= 1024
 
 # Server
 class RequestHandler(BaseHTTPRequestHandler):
@@ -111,7 +126,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 				Log.error(f'Download Failed: {E}')
 				self.send_response(500)
 				self.end_headers()
-	
+
 	def log_message(self, format, *args):
 		Log.debug(f'{self.address_string()} - {format % args}')
 
@@ -123,18 +138,18 @@ class Photos:
 		self.ProcessorTask = None
 		self.Queue = asyncio.Queue(maxsize=1)
 		self.GlobalQueue = queue.Queue(maxsize=1)
-		
+
 		self.LoopThread = threading.Thread(target=self._RunEventLoop)
 		self.LoopThread.daemon = True
 		self.LoopThread.start()
-		
+
 		while not hasattr(self, 'IsInitialized') or not self.IsInitialized:
 			time.sleep(0.1)
-		
+
 	def _RunEventLoop(self):
 		asyncio.set_event_loop(self.EventLoop)
 		self.EventLoop.run_forever()
-	
+
 	async def Initialize(self, Headless: bool):
 		self.PlaywrightInstance = await playwright.async_api.async_playwright().start()
 		self.Instance = await camoufox.AsyncNewBrowser(
@@ -154,27 +169,7 @@ class Photos:
 				java_script_enabled=True,
 				i_know_what_im_doing=True,
 				block_images=not Args.allow_images,
-				args=[
-					'--mute-audio', 
-					'--disable-audio-output',
-					'--disable-extensions',
-					'--disable-component-extensions-with-background-pages',
-					'--disable-background-networking',
-					'--disable-background-timer-throttling',
-					'--disable-backgrounding-occluded-windows',
-					'--disable-breakpad',
-					'--disable-default-apps',
-					'--disable-dev-shm-usage',
-					'--disable-features=TranslateUI,BlinkGenPropertyTrees',
-					'--disable-ipc-flooding-protection',
-					'--disable-renderer-backgrounding',
-					'--enable-features=NetworkService,NetworkServiceInProcess',
-					'--force-color-profile=srgb',
-					'--hide-scrollbars',
-					'--metrics-recording-only',
-					'--no-first-run',
-					'--password-store=basic'
-				]
+				args=[]
 			),
 			persistent_context=True
 		)
@@ -186,47 +181,50 @@ class Photos:
 		while not self.Page.url.startswith(Config.BaseURL):
 			Log.debug(f'Current URL: {self.Page.url}')
 			await asyncio.sleep(1)
-		
+
 		Log.info('Logged In')
 		await self.Page.goto('about:blank')
+		Log.info('Ready To Receive Requests, Start Your Rclone! 🚀')
 		self.StartServer()
 		self.ProcessorTask = self.EventLoop.create_task(self.ProcessQueue())
 		self.IsInitialized = True
-	
+
 	async def Setup(self):
 		Log.debug('Setting Up Browser Timeouts')
 		self.Page.context.set_default_timeout(0)
 		self.Page.context.set_default_navigation_timeout(0)
-	
+
 	async def Download(self, PhotoID):
-		Log.debug(f'Downloading Photo ID: {PhotoID[:10]}...')
+		Log.debug(f'Downloading Photo ID: ...{PhotoID[-10:]}')
 		await self.Page.goto(Config.GPhotoURL + PhotoID)
-		
+
 		async with self.Page.expect_download() as Info:
 			await self.Page.keyboard.press('Shift+D')
-		
+
 		Download = await Info.value
 		FilePath = str(Config.DownloadDirectory / Download.suggested_filename)
 		await Download.save_as(FilePath)
-		Log.info(f'Downloaded Photo ID: {PhotoID[:10]}...')
+
+		FileSize = os.path.getsize(FilePath)
+		Log.info(f'Downloaded Photo ID: ...{PhotoID[-10:]} ({HumanizeBytes(FileSize)})')
+
 		await self.Page.goto('about:blank')
 		return FilePath
-	
+
 	def StartServer(self):
 		Server = HTTPServer(('0.0.0.0', Config.ServerPort), lambda *args: RequestHandler(*args, app=self))
 		ServerThread = threading.Thread(target=Server.serve_forever)
 		ServerThread.daemon = True
 		ServerThread.start()
 		Log.debug(f'Server Started On Port {Config.ServerPort}')
-	
+
 	async def Receive(self, PhotoID):
-		Log.debug(f'Received Photo ID: {PhotoID[:10]}')
+		Log.debug(f'Received Photo ID: ...{PhotoID[-10:]}')
 		await self.Queue.put(PhotoID)
 
 	async def ProcessQueue(self):
 		try:
 			while True:
-				Log.debug(f'Queue Size: {self.Queue.qsize()}')
 				if not self.Queue.empty():
 					PhotoID = await self.Queue.get()
 					FilePath = await self.Download(PhotoID)
@@ -235,7 +233,7 @@ class Photos:
 				await asyncio.sleep(0.1)
 		except Exception as E:
 			Log.error(f'Queue processor error: {E}')
-			
+
 	async def Close(self):
 		try:
 			if hasattr(self, 'Instance') and self.Instance:
@@ -244,7 +242,7 @@ class Photos:
 				await self.PlaywrightInstance.stop()
 		except playwright.async_api.Error:
 			Log.warning('Browser Has Been Closed')
-			
+
 	def Shutdown(self):
 		if self.EventLoop and self.EventLoop.is_running():
 			self.EventLoop.create_task(self.Close())
@@ -258,7 +256,7 @@ if __name__ == '__main__':
 		Log.info('Starting Browser')
 		Instance = Photos(Args.headless)
 		Log.info('Browser Started')
-		
+
 		try:
 			while True:
 				time.sleep(0.5)
@@ -274,4 +272,7 @@ if __name__ == '__main__':
 		os._exit(1)
 	finally:
 		for File in Config.DownloadDirectory.iterdir():
-			File.unlink()
+			if File.is_file():
+				Log.debug(f'Deleted File: {File}')
+				File.unlink()
+		os.rmdir(Config.DownloadDirectory)
