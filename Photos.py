@@ -33,12 +33,10 @@ Args = Parser.parse_args()
 class Config:
 	BaseURL = 'https://photos.google.com/'
 	LoginURL = 'https://photos.google.com/login'
-	GPhotoURL = 'https://photos.google.com/lr/photo/'
-	GPhotoURLReal = 'https://photos.google.com/photo/'
+	PhotoURL = 'https://photos.google.com/lr/photo/'
 	Profile = Path(os.path.join(os.getcwd(), 'profile'))
 	DownloadDirectory = Path(os.path.join(os.getcwd(), 'downloads'))
 	ServerPort = Args.port
-	QueueMaxWait = 30
 
 # Logging Setup
 class DownloadHighlighter(RegexHighlighter):
@@ -196,7 +194,7 @@ class Photos:
 
 	async def Download(self, PhotoID):
 		Log.debug(f'Downloading Photo ID: ...{PhotoID[-10:]}')
-		await self.Page.goto(Config.GPhotoURL + PhotoID)
+		await self.Page.goto(Config.PhotoURL + PhotoID)
 
 		async with self.Page.expect_download() as Info:
 			await self.Page.keyboard.press('Shift+D')
@@ -261,7 +259,7 @@ if __name__ == '__main__':
 			while True:
 				time.sleep(0.5)
 		except KeyboardInterrupt:
-			Log.warning('Keyboard Interrupt Detected - Force Exiting')
+			Log.warning('Keyboard Interrupt Detected')
 			if Instance:
 				Instance.Shutdown()
 			os._exit(0)
