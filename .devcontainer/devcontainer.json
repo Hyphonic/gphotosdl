@@ -1,0 +1,12 @@
+{
+  "image": "mcr.microsoft.com/devcontainers/universal:2",
+  "features": {
+    "ghcr.io/devcontainers/features/desktop-lite:1": {}
+  },
+  "forwardPorts": [6090],
+  "portsAttributes": {
+    "6090": {
+      "label": "desktop"
+    }
+  }
+}
