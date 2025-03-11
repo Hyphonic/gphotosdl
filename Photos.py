@@ -43,13 +43,15 @@ class Config:
 class DownloadHighlighter(RegexHighlighter):
 	base_style = 'browser.'
 	highlights = [r'(?P<time>[\d.]+s)', r'\[(?P<error>error|Error)\]', r'\[(?P<warning>warning|Warning)\]',
-				  r'\[(?P<info>info|Info)\]', r'\[(?P<debug>debug|Debug)\]', r'(?P<size>\d+\.\d+ [KMGT]B)',
-				  fr'\.\.\.(?P<hash>[a-zA-Z0-9-_]{{{Config.PhotoIDTrim}}})', r'\[(?P<speed>\d+\.\d+ [KMGT]B/s)\]']
+					r'\[(?P<info>info|Info)\]', r'\[(?P<debug>debug|Debug)\]', r'(?P<size>\d+\.\d+ [KMGT]B)',
+					fr'(?P<hash>[a-zA-Z0-9-_]{{{Config.PhotoIDTrim}}})', r'\[(?P<speed>\d+\.\d+ [KMGT]B/s)\]',
+					r'(?:Downloaded |Uploaded And Deleted )(?P<filename>[^\(\s]+)(?=\s|\.{3}|\(|$)']
 
 ThemeDict = {**{f'logging.level.{lvl}': col for lvl, col in zip(['debug', 'info', 'warning', 'error'],
 			['#B3D7EC', '#A0D6B4', '#F5D7A3', '#F5A3A3'])},
 			**{f'browser.{key}': val for key, val in {'time': '#F5D7A3', 'error': '#F5A3A3', 'warning': '#F5D7A3',
-			'info': '#A0D6B4', 'debug': '#B3D7EC', 'size': '#A0D6B4', 'hash': '#B3D7EC', 'speed': '#D8BFD8'}.items()},
+			'info': '#A0D6B4', 'debug': '#B3D7EC', 'size': '#A0D6B4', 'hash': '#B3D7EC', 'speed': '#D8BFD8',
+			'filename': '#DDA0DD'}.items()},
 			'log.time': 'bright_black'}
 
 # Initialize logging
@@ -118,6 +120,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 							os.remove(FilePath)
 						except OSError as E: 
 							Log.warning(f'Failed To Delete {FilePath}: {E}')
+					Log.info(f'╰ Uploaded And Deleted {SafeFilename[:Config.FileNameTrim]}{"..." if len(SafeFilename) > Config.FileNameTrim else ""}')
 			except queue.Empty:
 				try: 
 					self.send_response(504), self.end_headers()
@@ -137,7 +140,7 @@ class Photos:
 	def __init__(self, Headless=False):
 		self.EventLoop = asyncio.new_event_loop()
 		self.Queue, self.GlobalQueue, self.PagePool, self.PageLock = asyncio.Queue(), queue.Queue(), [], asyncio.Lock()
-		self.MaxConcurrent, self.ActiveDownloads = Args.threads, 0
+		self.MaxConcurrent = Args.threads
 		self.ConfigInfo = {'Headless Mode': Args.headless, 'Debug Mode': Args.debug,
 						  'Server Port': Config.ServerPort, 'Allow Images': Args.allow_images,
 						  'Concurrent Downloads': self.MaxConcurrent}
@@ -218,8 +221,8 @@ class Photos:
 
 			FileSize = os.path.getsize(FilePath)
 			DownloadTime = time.time() - StartTime
-			Log.info(f'├ Downloaded: {PhotoID[-Config.PhotoIDTrim:]} ({HumanizeBytes(FileSize)}) in {DownloadTime:.2f}s [{HumanizeBytes(FileSize / DownloadTime)}/s]')
-			Log.info(f'╰ File Name: {SafeFilename[:Config.FileNameTrim]}{"..." if len(SafeFilename) > Config.FileNameTrim else ""}')
+			Log.info(f'├ Downloaded {SafeFilename[:Config.FileNameTrim]}{"..." if len(SafeFilename) > Config.FileNameTrim else ""} ({HumanizeBytes(FileSize)}) In {DownloadTime:.2f}s [{HumanizeBytes(FileSize / DownloadTime)}/s]')
+			Log.debug(f'├ File Saved To {FilePath}')
 
 			await Page.goto('about:blank')
 			return FilePath
@@ -253,7 +256,6 @@ class Photos:
 			if not self.PagePool:
 				await self.Queue.put((PhotoID, ResponseQueue))
 				return
-			self.ActiveDownloads += 1
 			Page = self.PagePool.pop()
 
 		try:
@@ -269,7 +271,6 @@ class Photos:
 		finally:
 			async with self.PageLock:
 				self.PagePool.append(Page)
-				self.ActiveDownloads -= 1
 
 	async def Close(self):
 		try:
