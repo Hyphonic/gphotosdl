@@ -4,7 +4,7 @@ import playwright, camoufox
 
 # Standard Library
 import threading, argparse, asyncio, queue, time, os, logging, socket
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # Logging
@@ -43,15 +43,13 @@ class Config:
 class DownloadHighlighter(RegexHighlighter):
 	base_style = 'browser.'
 	highlights = [r'(?P<time>[\d.]+s)', r'\[(?P<error>error|Error)\]', r'\[(?P<warning>warning|Warning)\]',
-					r'\[(?P<info>info|Info)\]', r'\[(?P<debug>debug|Debug)\]', r'(?P<size>\d+\.\d+ [KMGT]B)',
-					fr'(?P<hash>[a-zA-Z0-9-_]{{{Config.PhotoIDTrim}}})', r'\[(?P<speed>\d+\.\d+ [KMGT]B/s)\]',
-					r'(?:Downloaded |Uploaded And Deleted )(?P<filename>[^\(\s]+)(?=\s|\.{3}|\(|$)']
+				  r'\[(?P<info>info|Info)\]', r'\[(?P<debug>debug|Debug)\]', r'(?P<size>\d+\.\d+ [KMGT]B)',
+				  fr'(?P<hash>[a-zA-Z0-9-_]{{{Config.PhotoIDTrim}}})', r'\[(?P<speed>\d+\.\d+ [KMGT]B/s)\]']
 
 ThemeDict = {**{f'logging.level.{lvl}': col for lvl, col in zip(['debug', 'info', 'warning', 'error'],
 			['#B3D7EC', '#A0D6B4', '#F5D7A3', '#F5A3A3'])},
 			**{f'browser.{key}': val for key, val in {'time': '#F5D7A3', 'error': '#F5A3A3', 'warning': '#F5D7A3',
-			'info': '#A0D6B4', 'debug': '#B3D7EC', 'size': '#A0D6B4', 'hash': '#B3D7EC', 'speed': '#D8BFD8',
-			'filename': '#DDA0DD'}.items()},
+			'info': '#A0D6B4', 'debug': '#B3D7EC', 'size': '#A0D6B4', 'hash': '#B3D7EC', 'speed': '#D8BFD8'}.items()},
 			'log.time': 'bright_black'}
 
 # Initialize logging
@@ -81,10 +79,10 @@ class RequestHandler(BaseHTTPRequestHandler):
 			try:
 				self.send_response(200), self.send_header('Content-Type', 'text/html'), self.end_headers()
 				self.wfile.write(b'<h1>Google Photos Downloader</h1>')
-			except (ConnectionResetError, BrokenPipeError): 
+			except (ConnectionResetError, BrokenPipeError):
 				return
 		elif self.path.startswith('/id/'):
-			PhotoID, ResponseQueue, FilePath = self.path[4:], queue.Queue(), None
+			PhotoID, ResponseQueue = self.path[4:], queue.Queue()
 			try:
 				asyncio.run_coroutine_threadsafe(self.App.Receive(PhotoID, ResponseQueue), self.App.EventLoop)
 				FilePath = ResponseQueue.get(timeout=1800)
@@ -116,21 +114,21 @@ class RequestHandler(BaseHTTPRequestHandler):
 					return
 				finally:
 					if FilePath and os.path.exists(FilePath):
-						try: 
+						try:
 							os.remove(FilePath)
-						except OSError as E: 
+						except OSError as E:
 							Log.warning(f'Failed To Delete {FilePath}: {E}')
-					Log.info(f'╰ Uploaded And Deleted {SafeFilename[:Config.FileNameTrim]}{"..." if len(SafeFilename) > Config.FileNameTrim else ""}')
+					Log.info(f'╰ Uploaded And Deleted [magenta]{SafeFilename[:Config.FileNameTrim]}{"..." if len(SafeFilename) > Config.FileNameTrim else ""}[/]')
 			except queue.Empty:
-				try: 
+				try:
 					self.send_response(504), self.end_headers()
-				except (ConnectionResetError, BrokenPipeError): 
+				except (ConnectionResetError, BrokenPipeError):
 					return
 			except Exception as E:
 				try:
 					Log.error(f'Download Failed: {E}')
 					self.send_response(500), self.end_headers()
-				except (ConnectionResetError, BrokenPipeError): 
+				except (ConnectionResetError, BrokenPipeError):
 					return
 
 	def log_message(self, format, *args): Log.debug(f'{self.address_string()} - {format % args}')
@@ -140,7 +138,7 @@ class Photos:
 	def __init__(self, Headless=False):
 		self.EventLoop = asyncio.new_event_loop()
 		self.Queue, self.GlobalQueue, self.PagePool, self.PageLock = asyncio.Queue(), queue.Queue(), [], asyncio.Lock()
-		self.MaxConcurrent = Args.threads
+		self.MaxConcurrent, self.ActiveDownloads, self.TotalProcessed = Args.threads, 0, 0
 		self.ConfigInfo = {'Headless Mode': Args.headless, 'Debug Mode': Args.debug,
 						  'Server Port': Config.ServerPort, 'Allow Images': Args.allow_images,
 						  'Concurrent Downloads': self.MaxConcurrent}
@@ -150,13 +148,16 @@ class Photos:
 		self.LoopThread.daemon = True
 		self.LoopThread.start()
 
-		while not hasattr(self, 'IsInitialized') or not self.IsInitialized: 
+		self.StatsTask = threading.Thread(target=self.MonitorStats, daemon=True)
+		self.StatsTask.start()
+
+		while not hasattr(self, 'IsInitialized') or not self.IsInitialized:
 			time.sleep(0.1)
 
 	async def Initialize(self, Headless):
-		Log.info('Google Photos Downloader Configuration:')
-		for Key, Value in self.ConfigInfo.items(): 
-			Log.info(f'• {Key}: {Value}')
+		Log.debug('Google Photos Downloader Configuration:')
+		for Key, Value in self.ConfigInfo.items():
+			Log.debug(f'• {Key}: {Value}')
 
 		self.PlaywrightInstance = await playwright.async_api.async_playwright().start()
 		self.Instance = await camoufox.AsyncNewBrowser(
@@ -175,7 +176,7 @@ class Photos:
 
 		Log.info('Please Login To Google Photos')
 		await self.Page.goto(Config.LoginURL)
-		while not self.Page.url.startswith(Config.BaseURL): 
+		while not self.Page.url.startswith(Config.BaseURL):
 			await asyncio.sleep(1)
 
 		Log.info('Logged In')
@@ -191,7 +192,7 @@ class Photos:
 		Log.info(f'Created {self.MaxConcurrent} Browser Pages')
 
 		try:
-			Server = HTTPServer(('', Config.ServerPort), lambda *args: RequestHandler(*args, app=self))
+			Server = ThreadingHTTPServer(('', Config.ServerPort), lambda *args: RequestHandler(*args, app=self))
 			threading.Thread(target=Server.serve_forever, daemon=True).start()
 			Log.info(f'Server Started On Port {Config.ServerPort}')
 			for Interface in (sorted(set([socket.gethostbyname(socket.gethostname())] +
@@ -204,6 +205,18 @@ class Photos:
 		self.ProcessorTask = self.EventLoop.create_task(self.ProcessQueue())
 		self.IsInitialized = True
 		Log.info('Ready To Receive Requests, Start Your Rclone! 🚀')
+
+	def MonitorStats(self):
+		LastLog = time.time()
+		while True:
+			try:
+				if hasattr(self, 'IsInitialized') and self.IsInitialized and time.time() - LastLog >= 20:
+					Log.debug(f'System Stats: Queue={self.Queue.qsize()} | Pages={len(self.PagePool)}/{self.MaxConcurrent} | Active={self.ActiveDownloads} | Processed={self.TotalProcessed}')
+					LastLog = time.time()
+				time.sleep(1)
+			except Exception as E:
+				Log.error(f'Stats Error: {E}')
+				time.sleep(10)
 
 	async def Download(self, Page, PhotoID):
 		Log.info(f'╭ Downloading Photo ID: ...{PhotoID[-Config.PhotoIDTrim:]}')
@@ -221,7 +234,7 @@ class Photos:
 
 			FileSize = os.path.getsize(FilePath)
 			DownloadTime = time.time() - StartTime
-			Log.info(f'├ Downloaded {SafeFilename[:Config.FileNameTrim]}{"..." if len(SafeFilename) > Config.FileNameTrim else ""} ({HumanizeBytes(FileSize)}) In {DownloadTime:.2f}s [{HumanizeBytes(FileSize / DownloadTime)}/s]')
+			Log.info(f'├ Downloaded [magenta]{SafeFilename[:Config.FileNameTrim]}{"..." if len(SafeFilename) > Config.FileNameTrim else ""}[/] ({HumanizeBytes(FileSize)}) In {DownloadTime:.2f}s [{HumanizeBytes(FileSize / DownloadTime)}/s]')
 			Log.debug(f'├ File Saved To {FilePath}')
 
 			await Page.goto('about:blank')
@@ -252,37 +265,47 @@ class Photos:
 
 	async def ProcessDownload(self, PhotoData):
 		PhotoID, ResponseQueue = PhotoData if isinstance(PhotoData, tuple) else (PhotoData, None)
-		async with self.PageLock:
-			if not self.PagePool:
-				await self.Queue.put((PhotoID, ResponseQueue))
-				return
-			Page = self.PagePool.pop()
+		Page = None
+		for _ in range(10):
+			async with self.PageLock:
+				if self.PagePool:
+					Page = self.PagePool.pop()
+					self.ActiveDownloads += 1
+					break
+			await asyncio.sleep(1)
+
+		if not Page:
+			Log.warning(f'No Pages Available For ...{PhotoID[-Config.PhotoIDTrim:]}, Re-Queuing')
+			await self.Queue.put((PhotoID, ResponseQueue))
+			return
 
 		try:
 			FilePath = await self.Download(Page, PhotoID)
-			if ResponseQueue: 
+			self.TotalProcessed += 1
+			if ResponseQueue:
 				ResponseQueue.put(FilePath)
-			else: 
+			else:
 				self.GlobalQueue.put(FilePath)
 		except Exception as E:
-			Log.error(f'Download error for ...{PhotoID[-Config.PhotoIDTrim:]}: {E}')
-			if ResponseQueue: 
+			Log.error(f'Download Error For ...{PhotoID[-Config.PhotoIDTrim:]}: {E}')
+			if ResponseQueue:
 				ResponseQueue.put_nowait(None)
 		finally:
 			async with self.PageLock:
 				self.PagePool.append(Page)
+				self.ActiveDownloads -= 1
 
 	async def Close(self):
 		try:
-			if hasattr(self, 'Instance'): 
+			if hasattr(self, 'Instance'):
 				await self.Instance.close()
-			if hasattr(self, 'PlaywrightInstance'): 
+			if hasattr(self, 'PlaywrightInstance'):
 				await self.PlaywrightInstance.stop()
 		except playwright.async_api.Error as E:
 			Log.error(f'Error Closing Browser: {E}')
 
 	def Shutdown(self):
-		if hasattr(self, 'ProcessorTask'): 
+		if hasattr(self, 'ProcessorTask'):
 			self.ProcessorTask.cancel()
 		if self.EventLoop and self.EventLoop.is_running():
 			self.EventLoop.create_task(self.Close())
@@ -296,23 +319,23 @@ if __name__ == '__main__':
 		Config.InitializeFolders()
 		Instance = Photos(Args.headless)
 		try:
-			while True: 
+			while True:
 				time.sleep(0.5)
 		except KeyboardInterrupt:
 			Log.warning('Keyboard Interrupt Detected')
 		finally:
-			if Instance: 
+			if Instance:
 				Instance.Shutdown()
 			try:
 				for File in Config.DownloadDirectory.iterdir():
-					if File.is_file(): 
+					if File.is_file():
 						File.unlink()
 				Config.DownloadDirectory.rmdir()
 			except Exception as E:
-				if Args.debug: 
+				if Args.debug:
 					Log.warning(f'Cleanup Error: {E}')
 	except Exception as E:
 		Log.error(f'[{E.__class__.__name__}] {E}')
-		if Instance: 
+		if Instance:
 			Instance.Shutdown()
 		raise
